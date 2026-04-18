@@ -1,64 +1,166 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Minecraft Java Server Installer for Proxmox VM
-# Tested on Debian 11/12 and Ubuntu 24.04
-# Author: TimInTech
+# ── Minecraft Java Server Installer (VM) ── v3.0 ──
+# Uses PaperMC Fill v3 API (fill.papermc.io)
 
-set -euo pipefail  # Exit script on error, undefined variable, or failed pipeline
+USER_AGENT="minecraft-server-Proxmox/3.0 (https://github.com/TimInTech/minecraft-server-Proxmox)"
 
-# Install required dependencies
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y screen wget curl jq unzip
+sudo apt install -y screen wget curl jq unzip ca-certificates gnupg
 
-# Install Java: attempt to install OpenJDK 21 if available, otherwise fall back to OpenJDK 17.
-if ! sudo apt install -y openjdk-21-jre-headless; then
-  echo "openjdk-21-jre-headless is not available; falling back to openjdk-17-jre-headless"
-  sudo apt install -y openjdk-17-jre-headless
-fi
+ensure_java() {
+  # Prefer OpenJDK 21; fallback to Amazon Corretto 21 via APT keyring.
+  if sudo apt-get install -y openjdk-21-jre-headless 2>/dev/null; then return; fi
+  # NOTE: Adding a vendor APT source; restrict with signed-by keyring.
+  sudo install -d -m 0755 /usr/share/keyrings
+  curl -fsSL https://apt.corretto.aws/corretto.key | sudo gpg --dearmor -o /usr/share/keyrings/corretto.gpg
+  echo "deb [signed-by=/usr/share/keyrings/corretto.gpg] https://apt.corretto.aws stable main" | sudo tee /etc/apt/sources.list.d/corretto.list >/dev/null
+  sudo apt-get update
+  sudo apt-get install -y java-21-amazon-corretto-jre || sudo apt-get install -y java-21-amazon-corretto-jdk
+}
 
-# Set up server directory
+ensure_java
+
 sudo mkdir -p /opt/minecraft
-sudo chown "$(whoami)":"$(whoami)" /opt/minecraft
+if ! id -u minecraft >/dev/null 2>&1; then sudo useradd -r -m -s /bin/bash minecraft; fi
+sudo chown -R minecraft:minecraft /opt/minecraft
 cd /opt/minecraft
 
-# Fetch the latest PaperMC version
-LATEST_VERSION=$(curl -s https://api.papermc.io/v2/projects/paper | jq -r '.versions | last')
-LATEST_BUILD=$(curl -s https://api.papermc.io/v2/projects/paper/versions/"$LATEST_VERSION" | jq -r '.builds | last')
+printf '%s\n' "eula=true" > eula.txt
 
-# Validate if version and build numbers were retrieved
-if [[ -z "$LATEST_VERSION" || -z "$LATEST_BUILD" ]]; then
-  echo "ERROR: Unable to fetch the latest PaperMC version. Check https://papermc.io/downloads"
+# Autosize memory: Xms=RAM/4, Xmx=RAM/2; floors 1024M/2048M; cap Xmx ≤16G.
+mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo); mem_mb=$((mem_kb/1024))
+xmx=$(( mem_mb/2 ))
+if (( xmx < 2048 )); then
+  xmx=2048
+fi
+(( xmx > 16384 )) && xmx=16384
+xms=$(( mem_mb/4 ))
+if (( xms < 1024 )); then
+  xms=1024
+fi
+(( xms > xmx )) && xms=$xmx
+
+# ── Download latest stable PaperMC via Fill v3 API ──
+FILL_API="https://fill.papermc.io/v3/projects/paper"
+
+LATEST_VERSION=$(curl -fsSL -H "User-Agent: ${USER_AGENT}" "${FILL_API}" | jq -r '.versions | last')
+echo "Latest Minecraft version: ${LATEST_VERSION}"
+
+BUILDS_JSON=$(curl -fsSL -H "User-Agent: ${USER_AGENT}" "${FILL_API}/versions/${LATEST_VERSION}/builds")
+
+# Filter for STABLE channel; fall back to latest build if no stable exists yet
+STABLE_BUILD=$(printf '%s' "$BUILDS_JSON" | jq -r '
+  (map(select(.channel == "STABLE")) | sort_by(.id) | last) //
+  (sort_by(.id) | last)')
+
+if [[ -z "$STABLE_BUILD" || "$STABLE_BUILD" == "null" ]]; then
+  echo "ERROR: No builds found for version ${LATEST_VERSION}" >&2
   exit 1
 fi
 
-echo "📦 Downloading PaperMC - Version: $LATEST_VERSION, Build: $LATEST_BUILD"
-wget -O server.jar "https://api.papermc.io/v2/projects/paper/versions/$LATEST_VERSION/builds/$LATEST_BUILD/downloads/paper-$LATEST_VERSION-$LATEST_BUILD.jar"
+LATEST_BUILD=$(printf '%s' "$STABLE_BUILD" | jq -r '.id')
+DOWNLOAD_URL=$(printf '%s' "$STABLE_BUILD" | jq -r '.downloads."server:default".url // empty')
+EXPECTED_SHA=$(printf '%s' "$STABLE_BUILD" | jq -r '.downloads."server:default".checksums.sha256 // empty')
 
-# Accept the Minecraft EULA
-echo "eula=true" > eula.txt
+if [[ -z "$DOWNLOAD_URL" ]]; then
+  echo "ERROR: No download URL in API response for build ${LATEST_BUILD}" >&2
+  exit 1
+fi
 
-# Create start script
-cat <<EOF > start.sh
-#!/bin/bash
-java -Xms2G -Xmx4G -jar server.jar nogui
-EOF
+echo "Downloading PaperMC build ${LATEST_BUILD} for ${LATEST_VERSION}..."
+
+# NOTE: Enforce integrity and basic size sanity to avoid HTML error pages saved as JAR.
+curl -fL -H "User-Agent: ${USER_AGENT}" --retry 3 --retry-delay 2 -o server.jar "$DOWNLOAD_URL"
+ACTUAL_SHA=$(sha256sum server.jar | awk '{print $1}')
+if [[ -n "$EXPECTED_SHA" && "$EXPECTED_SHA" != "null" && "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+  echo "ERROR: SHA256 mismatch for PaperMC (expected ${EXPECTED_SHA}, got ${ACTUAL_SHA})" >&2
+  exit 1
+fi
+jar_size=$(stat -c '%s' server.jar)
+if (( jar_size < 5242880 )); then
+  echo "ERROR: Downloaded server.jar is too small (${jar_size} bytes). Likely an error page." >&2
+  exit 1
+fi
+echo "SHA256 verified: ${ACTUAL_SHA}"
+
+cat > start.sh <<E2
+#!/usr/bin/env bash
+exec java -Xms${xms}M -Xmx${xmx}M -jar server.jar nogui
+E2
 chmod +x start.sh
 
-# Create update script
-cat <<EOF > update.sh
-#!/bin/bash
-cd /opt/minecraft || exit 1
-LATEST_VERSION=\$(curl -s https://api.papermc.io/v2/projects/paper | jq -r '.versions | last')
-LATEST_BUILD=\$(curl -s https://api.papermc.io/v2/projects/paper/versions/\$LATEST_VERSION | jq -r '.builds | last')
+# Provide the updater script with the same integrity checks (Fill v3 API)
+cat > update.sh <<'E2'
+#!/usr/bin/env bash
+set -euo pipefail
 
-wget -O server.jar "https://api.papermc.io/v2/projects/paper/versions/\$LATEST_VERSION/builds/\$LATEST_BUILD/downloads/paper-\$LATEST_VERSION-\$LATEST_BUILD.jar"
-echo "✅ Update complete."
-EOF
+cd /opt/minecraft || exit 1
+
+USER_AGENT="minecraft-server-Proxmox/3.0 (https://github.com/TimInTech/minecraft-server-Proxmox)"
+FILL_API="https://fill.papermc.io/v3/projects/paper"
+
+LATEST_VERSION=$(curl -fsSL -H "User-Agent: ${USER_AGENT}" "${FILL_API}" | jq -r '.versions | last')
+echo "Latest Minecraft version: ${LATEST_VERSION}"
+
+BUILDS_JSON=$(curl -fsSL -H "User-Agent: ${USER_AGENT}" "${FILL_API}/versions/${LATEST_VERSION}/builds")
+
+STABLE_BUILD=$(printf '%s' "$BUILDS_JSON" | jq -r '
+  (map(select(.channel == "STABLE")) | sort_by(.id) | last) //
+  (sort_by(.id) | last)')
+
+if [[ -z "$STABLE_BUILD" || "$STABLE_BUILD" == "null" ]]; then
+  echo "ERROR: No builds found for version ${LATEST_VERSION}" >&2
+  exit 1
+fi
+
+LATEST_BUILD=$(printf '%s' "$STABLE_BUILD" | jq -r '.id')
+DOWNLOAD_URL=$(printf '%s' "$STABLE_BUILD" | jq -r '.downloads."server:default".url // empty')
+EXPECTED_SHA=$(printf '%s' "$STABLE_BUILD" | jq -r '.downloads."server:default".checksums.sha256 // empty')
+
+if [[ -z "$DOWNLOAD_URL" ]]; then
+  echo "ERROR: No download URL in API response for build ${LATEST_BUILD}" >&2
+  exit 1
+fi
+
+echo "Downloading PaperMC build ${LATEST_BUILD}..."
+curl -fL -H "User-Agent: ${USER_AGENT}" --retry 3 --retry-delay 2 -o server.jar "$DOWNLOAD_URL"
+
+jar_size=$(stat -c '%s' server.jar)
+if (( jar_size < 5242880 )); then
+  echo "ERROR: Downloaded server.jar is too small (${jar_size} bytes). Likely an error page." >&2
+  exit 1
+fi
+
+ACTUAL_SHA=$(sha256sum server.jar | awk '{print $1}')
+if [[ -n "${EXPECTED_SHA}" && "${EXPECTED_SHA}" != "null" ]]; then
+  if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]]; then
+    echo "ERROR: SHA256 mismatch for PaperMC (expected ${EXPECTED_SHA}, got ${ACTUAL_SHA})" >&2
+    exit 1
+  fi
+  echo "SHA256 verified: ${ACTUAL_SHA}"
+else
+  echo "WARNING: No upstream SHA provided; computed: ${ACTUAL_SHA}"
+fi
+
+echo "✅ Update complete to version ${LATEST_VERSION} (build ${LATEST_BUILD})"
+E2
 chmod +x update.sh
 
-# Start server in detached screen session
-screen -dmS minecraft ./start.sh
+sudo chown -R minecraft:minecraft /opt/minecraft
 
-echo "✅ Minecraft Server setup complete!"
-echo "To access console: sudo -u $(whoami) screen -r minecraft"
+# Ensure screen runtime directory exists with correct ownership and mode
+# NOTE: Required on Debian 11/12/13 so screen can create sockets.
+sudo install -d -m 0775 -o root -g utmp /run/screen || true
+# NOTE: Persist /run/screen via systemd-tmpfiles to survive reboots
+printf 'd /run/screen 0775 root utmp -\n' | sudo tee /etc/tmpfiles.d/screen.conf >/dev/null
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/screen.conf || true
 
+if command -v runuser >/dev/null 2>&1; then
+  runuser -u minecraft -- bash -lc 'cd /opt/minecraft && screen -dmS minecraft ./start.sh'
+else
+  sudo -u minecraft bash -lc 'cd /opt/minecraft && screen -dmS minecraft ./start.sh'
+fi
+
+echo "✅ Minecraft Java setup complete. Attach: screen -r minecraft"

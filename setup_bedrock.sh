@@ -1,67 +1,86 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Minecraft Bedrock Server Installer for Proxmox LXC/VM
-# Tested on Debian 11/12 and Ubuntu 24.04
-# Author: TimInTech
+# ── Minecraft Bedrock Server Installer ── v3.0 ──
 
-set -euo pipefail  # Exit on error, unset variable, or failed pipeline
+apt update
+apt install -y unzip wget screen curl ca-certificates
 
-# Install required dependencies
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y unzip wget screen curl
-
-# Set up server directory
-sudo mkdir -p /opt/minecraft-bedrock
-sudo chown "$(whoami)":"$(whoami)" /opt/minecraft-bedrock
+if ! id -u minecraft >/dev/null 2>&1; then useradd -r -m -s /bin/bash minecraft; fi
+mkdir -p /opt/minecraft-bedrock
+chown -R minecraft:minecraft /opt/minecraft-bedrock
 cd /opt/minecraft-bedrock
 
-# Fetch the latest Bedrock server URL
-LATEST_URL=$(curl -s https://www.minecraft.net/en-us/download/server/bedrock | grep -o 'https://minecraft.azureedge.net/bin-linux/bedrock-server-[0-9.]*.zip' | head -1)
-
-# Exit if no URL was found
-if [[ -z "$LATEST_URL" ]]; then
-  echo "ERROR: Couldn't retrieve the latest Bedrock server URL."
+# Scrape Mojang page for the latest Linux ZIP link
+# NOTE: Regex matches both old (1.x.x) and new (26.x) Mojang versioning schemes
+HTML=$(curl -fsSL --http1.1 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36" "https://www.minecraft.net/en-us/download/server/bedrock")
+LATEST_URL=$(printf '%s' "$HTML" | grep -Eo 'https://www\.minecraft\.net/bedrockdedicatedserver/bin-linux/bedrock-server-[0-9.]+\.zip' | head -1)
+if [[ -z "${LATEST_URL:-}" ]]; then
+  echo "ERROR: Could not find Bedrock server URL on Mojang page" >&2
   exit 1
 fi
 
-echo "Downloading Minecraft Bedrock Server from: $LATEST_URL"
-if ! wget -O bedrock-server.zip "$LATEST_URL"; then
-  echo "ERROR: Download failed. Check your internet connection."
+# HEAD check for MIME type and optional size
+if ! curl -fsSI --http1.1 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36" "$LATEST_URL" | grep -iqE '^content-type:\s*(application/zip|application/octet-stream)'; then
+  echo "ERROR: Unexpected Content-Type for Bedrock ZIP (must be application/zip or octet-stream)" >&2
+  exit 1
+fi
+echo "Downloading: $LATEST_URL"
+curl -fL --http1.1 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36" --retry 3 --retry-delay 2 -o bedrock-server.zip "$LATEST_URL"
+zip_size=$(stat -c '%s' bedrock-server.zip)
+if (( zip_size < 1048576 )); then # 1MB sanity check
+  echo "ERROR: Downloaded bedrock-server.zip is too small (${zip_size} bytes)." >&2
   exit 1
 fi
 
-# Check if the file is a valid ZIP archive
-if ! unzip -tq bedrock-server.zip >/dev/null; then
-  echo "ERROR: The downloaded file is not a valid ZIP archive."
-  rm -f bedrock-server.zip
+ACTUAL_SHA=$(sha256sum bedrock-server.zip | awk '{print $1}')
+echo "bedrock-server.zip sha256: ${ACTUAL_SHA}"
+
+# NOTE: Enforce checksum by default; require REQUIRED_BEDROCK_SHA256 when REQUIRE_BEDROCK_SHA=1
+if [[ "${REQUIRE_BEDROCK_SHA:=1}" = "1" ]]; then
+  if [[ -z "${REQUIRED_BEDROCK_SHA256:-}" ]]; then
+    echo "ERROR: Set REQUIRED_BEDROCK_SHA256 to a known-good value (export REQUIRED_BEDROCK_SHA256=<sha>)" >&2
+    exit 1
+  fi
+  if [[ "${ACTUAL_SHA}" != "${REQUIRED_BEDROCK_SHA256}" ]]; then
+    echo "ERROR: SHA256 mismatch (expected ${REQUIRED_BEDROCK_SHA256}, got ${ACTUAL_SHA})" >&2
+    exit 1
+  fi
+fi
+
+# Test and extract the archive
+unzip -tq bedrock-server.zip >/dev/null
+unzip -o bedrock-server.zip && rm -f bedrock-server.zip
+
+if [[ ! -f bedrock_server ]]; then
+  echo "ERROR: bedrock_server binary missing after extraction" >&2
   exit 1
 fi
 
-# Extract the server files
-unzip -o bedrock-server.zip
-rm -f bedrock-server.zip
-
-# Make sure the server binary exists
-if [[ ! -f "bedrock_server" ]]; then
-  echo "ERROR: The server binary is missing. Installation failed."
-  exit 1
-fi
-
-# Create start script
-cat <<EOF > start.sh
-#!/bin/bash
-LD_LIBRARY_PATH=. ./bedrock_server
-EOF
-
+cat > start.sh <<'E2'
+#!/usr/bin/env bash
+exec env LD_LIBRARY_PATH=. ./bedrock_server
+E2
 chmod +x start.sh
 
-# Ensure screen is installed before starting the server
-if ! command -v screen &> /dev/null; then
-  echo "ERROR: 'screen' is not installed. Install it with 'sudo apt install screen'."
-  exit 1
+chown -R minecraft:minecraft /opt/minecraft-bedrock
+
+# Ensure screen runtime directory exists with correct ownership and mode
+# NOTE: Required on Debian 12/13 so screen can create sockets.
+# In LXC, utmp group may not exist; fall back to root:root with 0777
+if getent group utmp >/dev/null 2>&1; then
+  install -d -m 0775 -o root -g utmp /run/screen || true
+  printf 'd /run/screen 0775 root utmp -\n' > /etc/tmpfiles.d/screen.conf
+else
+  install -d -m 0777 -o root -g root /run/screen || true
+  printf 'd /run/screen 0777 root root -\n' > /etc/tmpfiles.d/screen.conf
+fi
+systemd-tmpfiles --create /etc/tmpfiles.d/screen.conf || true
+
+if command -v runuser >/dev/null 2>&1; then
+  runuser -u minecraft -- bash -lc 'cd /opt/minecraft-bedrock && screen -dmS bedrock ./start.sh'
+else
+  su -s /bin/bash -c 'cd /opt/minecraft-bedrock && screen -dmS bedrock ./start.sh' minecraft
 fi
 
-# Start the server in a detached screen session
-screen -dmS bedrock ./start.sh
-
-echo "Setup complete! Use 'screen -r bedrock' to open the console."
+echo "✅ Setup complete. Attach: screen -r bedrock"
